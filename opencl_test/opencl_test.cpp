@@ -3,6 +3,7 @@
 #include <iostream>
 #include <assert.h>
 #include <random>
+#include <string>
 
 std::string stringError(cl_int err)
 {
@@ -175,6 +176,17 @@ std::string getInfo(cl_platform_id platform, PlatformInfoType type)
 	free(buff);
 	return res;
 }
+
+int getIntInfo(cl_device_id device, cl_device_info type)
+{
+
+	size_t res;
+	int err = clGetDeviceInfo(device, type, sizeof(size_t), &res, NULL);
+	if (!isOk(err))
+		throw clDeviceInfoError(err);
+
+	return res;
+}
 //too many variants to create enum so use raw
 std::string getInfo(cl_device_id device, cl_device_info type)
 {
@@ -226,10 +238,7 @@ std::vector<cl_platform_id> getGpuPlatforms()
 	return res;
 }
 
-void cl_notify(const char* err_info, const void* private_info, size_t cb, void* user_data)
-{
-	throw "Error at context: " + std::string(err_info);
-}
+
 
 cl_context createContext(cl_platform_id platform)
 {
@@ -239,7 +248,7 @@ cl_context createContext(cl_platform_id platform)
 
 	auto devices = getDevices(platform, DEVICE_TYPE_GPU);
 	cl_int err;
-	cl_context res = clCreateContext(properties, devices.size(), devices.data(), &cl_notify, NULL, &err);
+	cl_context res = clCreateContext(properties, devices.size(), devices.data(), NULL, NULL, &err);
 
 	if (!isOk(err))
 		throw stringError(err);
@@ -414,7 +423,7 @@ void setKernelArg(cl_kernel kernel, int argnum, T arg_value)
 //throws you into place where throwing happened
 int main()
 {
-
+	
 	auto platforms = getGpuPlatforms();
 	if (platforms.size() == 0)
 	{
@@ -425,36 +434,82 @@ int main()
 
 	cl_command_queue queue = createCommandQueue(context, *getDevices(platforms[0], DEVICE_TYPE_GPU).data());
 
+
 	int X = 1000, AY = 1000, Y = 1000;
 
 	auto A = randMatrix(X, AY), B = randMatrix(AY, Y), C = randMatrix(X, Y);
 
 	int alpha = 2, beta = 3;
-	
+	//bigger is not possible since iris xe gives CL_DEVICE_MAX_WORK_GROUP_SIZE as 256
+	int TS = 10;
+
 	cl_mem Abuff = vectorToClBuffer<int>(context, queue, A, true);
 	cl_mem Bbuff = vectorToClBuffer<int>(context, queue, B, true);
-	
+
 	//cl_mem Cbuff = createOutputBuffer(context, A.size() * B[0].size() * sizeof(int), true);
 	cl_mem Cbuff = vectorToClBuffer<int>(context, queue, C, true, true);
-	
 
-	const char* code = STRINGIFY(__kernel void gemm(__global int* A, __global int* B, __global int* C, int AX, int BX, int BY,
-		int alpha, int beta)
+
+	/*const char* code = STRINGIFY(__kernel void gemm(__global int* A, __global int* B, __global int* C, int AX, int BX, int BY,
+		int alpha, int beta, int TS)
 	{
 		int i = get_global_id(0);
 		int j = get_global_id(1);
-		
+
 		int sum = 0;
 		for (int k = 0; k < BX; ++k)
 			sum += A[i * BX + k] * B[k * BY + j];
 
 		C[i * BY + j] = alpha * sum + beta * C[i * BY + j];
-	});
+	});*/
+	std::string code = STRINGIFY(__kernel void gemm(__global int * A, __global int * B, __global int * C, int AX, int AY, int BY,
+		int alpha, int beta)
+	{
 
+	int k, t;
+	const int row = get_local_id(0);                  // Local row ID (max: TS)
+	const int col = get_local_id(1);                  // Local col ID (max: TS)
+	const int globalRow = TS * get_group_id(0) + row; // Row ID of C (0..M)
+	const int globalCol = TS * get_group_id(1) + col; // Col ID of C (0..N)
 
-	cl_program program = clCreateProgramWithSource(context, 1, &code, NULL, NULL);
+	__local int Asub[TS][TS];
+	__local int Bsub[TS][TS];
+
+	int acc = 0;
+
+	const int numTiles = AY / TS;
+
+	for (t = 0; t < numTiles; t++) {
+		const int tiledRow = TS * t + row;
+		const int tiledCol = TS * t + col;
+		Asub[col][row] = A[globalRow * AY + tiledCol];
+		Bsub[col][row] = B[tiledRow * BY + globalCol];
+
+		// Synchronise to make sure the tile is loaded
+		barrier(CLK_LOCAL_MEM_FENCE);
+
+		for (k = 0; k < TS; k++)
+			acc += Asub[k][row] * Bsub[col][k];
+
+		// Synchronise before loading the next tile
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+
+	// Store the final result in C
+	C[globalRow * BY + globalCol] = alpha * acc + beta * C[globalRow * BY + globalCol];
+});
+	code = "#define TS " + std::to_string(TS) + "\n" + code;
+	const char* codechar = code.data();
+
+	cl_program program = clCreateProgramWithSource(context, 1, &codechar, NULL, NULL);
 	int ret = clBuildProgram(program, 0, NULL, NULL, NULL, NULL);
-
+	if (ret == CL_BUILD_PROGRAM_FAILURE)
+	{
+		char log[10000];
+		clGetProgramBuildInfo(program, getDevices(platforms[0], DEVICE_TYPE_GPU)[0], CL_PROGRAM_BUILD_LOG, 10000, log, NULL);
+		printf("%s", log);
+		system("pause");
+	}
 	
 	cl_kernel kernel = clCreateKernel(program, "gemm", NULL);
 
@@ -468,12 +523,15 @@ int main()
 	setKernelArg(kernel, 6, alpha);
 	setKernelArg(kernel, 7, beta);
 
-	size_t work_size[2] = { A.size(), B[0].size() };
+	size_t work_size[2] = { A.size()  , B[0].size() };
+
+	size_t local_group[2] = { TS, TS };
 
 	time_t t1, t2;
 	t1 = clock();
-	int res = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, work_size, NULL, 0, NULL, NULL);
-	
+
+	int res = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, work_size, local_group, 0, NULL, NULL);
+
 	if (!isOk(res))
 		throw stringError(res);
 
