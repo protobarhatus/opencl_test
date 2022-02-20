@@ -85,7 +85,24 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="opencl_test.cpp" />
+    <ClCompile Include="code_load.cpp" />
+    <ClCompile Include="error_treatment.cpp" />
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="openclwrap.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="code_load.h" />
+    <ClInclude Include="data_to_raw.h" />
+    <ClInclude Include="error_treatment.h" />
+    <ClInclude Include="openclwrap.h" />
+    <ClInclude Include="useful_vector_funcs.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="data_to_raw.inl" />
+    <None Include="gemm.h">
+      <FileType>Document</FileType>
+    </None>
+    <None Include="useful_vector_funcs.inl" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
